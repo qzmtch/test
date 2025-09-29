@@ -3,8 +3,7 @@ name: Build yt-dlp extracts
 on:
   workflow_dispatch: {}
   schedule:
-    # раз в 6 часов; при желании измените
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *" # раз в 6 часов
 
 concurrency:
   group: ytdlp-extracts
@@ -14,7 +13,7 @@ jobs:
   extract:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # нужно для создания/обновления релиза
+      contents: write
 
     steps:
       - name: Checkout this repo
@@ -42,20 +41,34 @@ jobs:
           path: vendor/yt-dlp
           fetch-depth: 1
 
-      - name: Extract _VALID_URL and test urls
+      - name: Extract _VALID_URL, _EMBED_REGEX and test urls
         run: |
           python - <<'PY'
-          import sys, importlib, inspect
+          import sys, importlib, inspect, re
           from pathlib import Path
 
           root = Path('vendor/yt-dlp')
           sys.path.insert(0, str(root))
 
           regexes = set()
+          embed_regexes = set()
           urls = set()
 
           from yt_dlp.extractor.common import InfoExtractor
           extractor_dir = root / 'yt_dlp' / 'extractor'
+
+          Pattern = getattr(re, "Pattern", type(re.compile("")))
+
+          def add_regex(val, dest):
+            if not val:
+              return
+            if isinstance(val, str):
+              dest.add(val)
+            elif isinstance(val, Pattern):
+              dest.add(val.pattern)
+            elif isinstance(val, (list, tuple, set)):
+              for v in val:
+                add_regex(v, dest)
 
           for p in extractor_dir.glob('*.py'):
             if p.name in ('__init__.py', '_extractors.py'):
@@ -69,32 +82,35 @@ jobs:
 
             for name, obj in m.__dict__.items():
               if inspect.isclass(obj) and issubclass(obj, InfoExtractor) and obj is not InfoExtractor:
-                rx = getattr(obj, '_VALID_URL', None)
-                if isinstance(rx, str) and rx:
-                  regexes.add(rx)
+                add_regex(getattr(obj, '_VALID_URL', None), regexes)
+                add_regex(getattr(obj, '_EMBED_REGEX', None), embed_regexes)
 
                 tests = []
-                if hasattr(obj, '_TESTS') and isinstance(obj._TESTS, (list, tuple)):
-                  tests.extend(obj._TESTS)
-                if hasattr(obj, '_TEST') and isinstance(obj._TEST, dict):
-                  tests.append(obj._TEST)
+                _tests = getattr(obj, '_TESTS', None)
+                if isinstance(_tests, (list, tuple)):
+                  tests.extend(_tests)
+                _test = getattr(obj, '_TEST', None)
+                if isinstance(_test, dict):
+                  tests.append(_test)
 
                 for t in tests:
-                  try:
+                  if isinstance(t, dict):
                     u = t.get('url')
-                  except Exception:
-                    u = None
-                  if isinstance(u, str) and u:
-                    urls.add(u)
+                    if isinstance(u, str) and u:
+                      urls.add(u)
 
           Path('artifacts').mkdir(exist_ok=True)
-          with open('artifacts/valid_url_regexes.txt', 'w', encoding='utf-8') as f:
-            for r in sorted(regexes):
-              f.write(r + '\n')
-          with open('artifacts/test_urls.txt', 'w', encoding='utf-8') as f:
-            for u in sorted(urls):
-              f.write(u + '\n')
-          print(f"Wrote {len(regexes)} regexes and {len(urls)} urls")
+
+          def write_sorted(name, data):
+            with open(f'artifacts/{name}', 'w', encoding='utf-8') as f:
+              for s in sorted(data):
+                f.write(s + '\n')
+
+          write_sorted('valid_url_regexes.txt', regexes)
+          write_sorted('embed_regexes.txt', embed_regexes)
+          write_sorted('test_urls.txt', urls)
+
+          print(f"Wrote {len(regexes)} _VALID_URL, {len(embed_regexes)} _EMBED_REGEX and {len(urls)} test urls")
           PY
 
       - name: Publish to single tag/release
@@ -102,9 +118,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="ytdlp-extracts"
-          TITLE="yt-dlp _VALID_URL and test urls"
+          TITLE="yt-dlp _VALID_URL, _EMBED_REGEX and test urls"
           NOTES="Auto-updated from yt-dlp ${YTDLP_TAG}"
-          # Создаём релиз с тегом, если его ещё нет
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TITLE" --notes "$NOTES"
-          # Загружаем ассеты с перезаписью (один и тот же тег)
-          gh release upload "$TAG" artifacts/valid_url_regexes.txt artifacts/test_urls.txt --clobber
+          gh release upload "$TAG" \
+            artifacts/valid_url_regexes.txt \
+            artifacts/embed_regexes.txt \
+            artifacts/test_urls.txt \
+            --clobber
