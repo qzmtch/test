@@ -1,0 +1,110 @@
+name: Build yt-dlp extracts
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # раз в 6 часов; при желании измените
+    - cron: "0 */6 * * *"
+
+concurrency:
+  group: ytdlp-extracts
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # нужно для создания/обновления релиза
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Get latest yt-dlp release tag
+        id: get_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh api repos/yt-dlp/yt-dlp/releases/latest --jq .tag_name)
+          echo "YTDLP_TAG=$TAG" >> $GITHUB_ENV
+          echo "Latest yt-dlp release: $TAG"
+
+      - name: Checkout yt-dlp at the release tag
+        uses: actions/checkout@v4
+        with:
+          repository: yt-dlp/yt-dlp
+          ref: ${{ env.YTDLP_TAG }}
+          path: vendor/yt-dlp
+          fetch-depth: 1
+
+      - name: Extract _VALID_URL and test urls
+        run: |
+          python - <<'PY'
+          import sys, importlib, inspect
+          from pathlib import Path
+
+          root = Path('vendor/yt-dlp')
+          sys.path.insert(0, str(root))
+
+          regexes = set()
+          urls = set()
+
+          from yt_dlp.extractor.common import InfoExtractor
+          extractor_dir = root / 'yt_dlp' / 'extractor'
+
+          for p in extractor_dir.glob('*.py'):
+            if p.name in ('__init__.py', '_extractors.py'):
+              continue
+            modname = f"yt_dlp.extractor.{p.stem}"
+            try:
+              m = importlib.import_module(modname)
+            except Exception as e:
+              print(f"[WARN] skip {modname}: {e}")
+              continue
+
+            for name, obj in m.__dict__.items():
+              if inspect.isclass(obj) and issubclass(obj, InfoExtractor) and obj is not InfoExtractor:
+                rx = getattr(obj, '_VALID_URL', None)
+                if isinstance(rx, str) and rx:
+                  regexes.add(rx)
+
+                tests = []
+                if hasattr(obj, '_TESTS') and isinstance(obj._TESTS, (list, tuple)):
+                  tests.extend(obj._TESTS)
+                if hasattr(obj, '_TEST') and isinstance(obj._TEST, dict):
+                  tests.append(obj._TEST)
+
+                for t in tests:
+                  try:
+                    u = t.get('url')
+                  except Exception:
+                    u = None
+                  if isinstance(u, str) and u:
+                    urls.add(u)
+
+          Path('artifacts').mkdir(exist_ok=True)
+          with open('artifacts/valid_url_regexes.txt', 'w', encoding='utf-8') as f:
+            for r in sorted(regexes):
+              f.write(r + '\n')
+          with open('artifacts/test_urls.txt', 'w', encoding='utf-8') as f:
+            for u in sorted(urls):
+              f.write(u + '\n')
+          print(f"Wrote {len(regexes)} regexes and {len(urls)} urls")
+          PY
+
+      - name: Publish to single tag/release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="ytdlp-extracts"
+          TITLE="yt-dlp _VALID_URL and test urls"
+          NOTES="Auto-updated from yt-dlp ${YTDLP_TAG}"
+          # Создаём релиз с тегом, если его ещё нет
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TITLE" --notes "$NOTES"
+          # Загружаем ассеты с перезаписью (один и тот же тег)
+          gh release upload "$TAG" artifacts/valid_url_regexes.txt artifacts/test_urls.txt --clobber
