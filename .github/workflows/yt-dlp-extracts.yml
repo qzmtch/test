@@ -41,10 +41,11 @@ jobs:
           path: vendor/yt-dlp
           fetch-depth: 1
 
-      - name: Extract _VALID_URL, _EMBED_REGEX and test urls
+      - name: Extract _VALID_URL, _EMBED_REGEX, test urls and domains
         run: |
           python - <<'PY'
           import sys, importlib, inspect, re
+          from urllib.parse import urlparse
           from pathlib import Path
 
           root = Path('vendor/yt-dlp')
@@ -53,6 +54,7 @@ jobs:
           regexes = set()
           embed_regexes = set()
           urls = set()
+          domains = set()
 
           from yt_dlp.extractor.common import InfoExtractor
           extractor_dir = root / 'yt_dlp' / 'extractor'
@@ -99,6 +101,19 @@ jobs:
                     if isinstance(u, str) and u:
                       urls.add(u)
 
+          # домены из test_urls
+          for u in urls:
+            try:
+              host = urlparse(u).hostname
+            except Exception:
+              host = None
+            if not host:
+              continue
+            host = host.lower().strip('.')
+            if host.startswith('www.'):
+              host = host[4:]
+            domains.add(host)
+
           Path('artifacts').mkdir(exist_ok=True)
 
           def write_sorted(name, data):
@@ -109,8 +124,9 @@ jobs:
           write_sorted('valid_url_regexes.txt', regexes)
           write_sorted('embed_regexes.txt', embed_regexes)
           write_sorted('test_urls.txt', urls)
+          write_sorted('test_domains.txt', domains)
 
-          print(f"Wrote {len(regexes)} _VALID_URL, {len(embed_regexes)} _EMBED_REGEX and {len(urls)} test urls")
+          print(f"Wrote {len(regexes)} _VALID_URL, {len(embed_regexes)} _EMBED_REGEX, {len(urls)} test urls, {len(domains)} domains")
           PY
 
       - name: Publish to single tag/release
@@ -118,11 +134,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="ytdlp-extracts"
-          TITLE="yt-dlp _VALID_URL, _EMBED_REGEX and test urls"
+          TITLE="yt-dlp _VALID_URL, _EMBED_REGEX, test urls and domains"
           NOTES="Auto-updated from yt-dlp ${YTDLP_TAG}"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TITLE" --notes "$NOTES"
           gh release upload "$TAG" \
             artifacts/valid_url_regexes.txt \
             artifacts/embed_regexes.txt \
             artifacts/test_urls.txt \
+            artifacts/test_domains.txt \
             --clobber
