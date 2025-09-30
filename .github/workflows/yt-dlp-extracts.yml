@@ -1,9 +1,14 @@
 name: Build yt-dlp extracts
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force run even if upstream tag unchanged'
+        type: boolean
+        default: false
   schedule:
-    - cron: "0 */6 * * *" # раз в 6 часов
+    - cron: "0 0 * * *" # раз в сутки (UTC)
 
 concurrency:
   group: ytdlp-extracts
@@ -24,24 +29,63 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Get latest yt-dlp release tag
-        id: get_tag
+      - name: Detect upstream build and decide
+        id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force }}
         run: |
-          TAG=$(gh api repos/yt-dlp/yt-dlp/releases/latest --jq .tag_name)
-          echo "YTDLP_TAG=$TAG" >> $GITHUB_ENV
-          echo "Latest yt-dlp release: $TAG"
+          set -e
 
-      - name: Checkout yt-dlp at the release tag
+          # 1) Получаем последний релиз master-builds
+          UPSTREAM_TAG=$(gh api repos/yt-dlp/yt-dlp-master-builds/releases/latest --jq .tag_name)
+          UPSTREAM_BODY=$(gh api repos/yt-dlp/yt-dlp-master-builds/releases/latest --jq .body)
+          echo "Latest upstream tag: $UPSTREAM_TAG"
+
+          # 2) Пытаемся достать SHA коммита yt-dlp из описания релиза
+          CAND=$(printf "%s" "$UPSTREAM_BODY" | grep -Eoi "(commit|yt-dlp)\s*[:#]?\s*([0-9a-f]{7,40})" | head -n1 || true)
+          YTDLP_REF=$(printf "%s" "$CAND" | grep -Eo "[0-9a-f]{7,40}" || true)
+          if [ -z "$YTDLP_REF" ]; then
+            YTDLP_REF="master"
+            echo "No commit found in release body; using yt-dlp ref: master"
+          else
+            echo "Using yt-dlp ref (commit): $YTDLP_REF"
+          fi
+
+          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
+          echo "YTDLP_REF=$YTDLP_REF" >> $GITHUB_ENV
+
+          # 3) Проверяем что уже публиковали для этого тега (если не force)
+          TARGET_TAG="ytdlp-extracts"
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            gh release download "$TARGET_TAG" -p source_tag.txt -D . >/dev/null 2>&1 || true
+          fi
+          PREV_TAG="$(cat source_tag.txt 2>/dev/null || echo '')"
+          echo "Previous processed tag: ${PREV_TAG:-<none>}"
+
+          # 4) Решение о запуске
+          if [ "${FORCE}" = "true" ] || [ "${FORCE}" = "1" ]; then
+            echo "Force run requested via workflow_dispatch."
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          elif [ "$PREV_TAG" = "$UPSTREAM_TAG" ]; then
+            echo "No new upstream tag ($UPSTREAM_TAG). Skipping."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          else
+            echo "New upstream tag detected: $UPSTREAM_TAG"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout yt-dlp at detected ref
+        if: steps.check.outputs.should_run == 'true'
         uses: actions/checkout@v4
         with:
           repository: yt-dlp/yt-dlp
-          ref: ${{ env.YTDLP_TAG }}
+          ref: ${{ env.YTDLP_REF }}
           path: vendor/yt-dlp
           fetch-depth: 1
 
       - name: Extract _VALID_URL, _EMBED_REGEX, test urls and domains
+        if: steps.check.outputs.should_run == 'true'
         run: |
           python - <<'PY'
           import sys, importlib, inspect, re
@@ -129,17 +173,28 @@ jobs:
           print(f"Wrote {len(regexes)} _VALID_URL, {len(embed_regexes)} _EMBED_REGEX, {len(urls)} test urls, {len(domains)} domains")
           PY
 
+      - name: Write source tag file
+        if: steps.check.outputs.should_run == 'true'
+        run: |
+          mkdir -p artifacts
+          printf "%s\n" "$UPSTREAM_TAG" > artifacts/source_tag.txt
+
       - name: Publish to single tag/release
+        if: steps.check.outputs.should_run == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="ytdlp-extracts"
-          TITLE="yt-dlp _VALID_URL, _EMBED_REGEX, test urls and domains"
-          NOTES="Auto-updated from yt-dlp ${YTDLP_TAG}"
+          TITLE="yt-dlp extracts: _VALID_URL, _EMBED_REGEX, test urls and domains"
+          NOTES="Auto-updated from yt-dlp-master-builds ${UPSTREAM_TAG} (yt-dlp ref: ${YTDLP_REF})"
+
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TITLE" --notes "$NOTES"
+          gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+
           gh release upload "$TAG" \
             artifacts/valid_url_regexes.txt \
             artifacts/embed_regexes.txt \
             artifacts/test_urls.txt \
             artifacts/test_domains.txt \
+            artifacts/source_tag.txt \
             --clobber
